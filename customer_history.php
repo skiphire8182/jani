@@ -1,224 +1,145 @@
 <?php
-// Add any required includes
 require_once '../includes/db.php';
-require_once '../includes/functions.php';
-?>
 
-<style>
-.order-status .badge {
-    margin-right: 8px;
+header('Content-Type: application/json');
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+try {
+    $pdo = getDbConnection();
+    
+    // Get search term and sanitize it
+    $search = isset($_GET['search']) ? trim($_GET['search']) : '';
+    if (empty($search)) {
+        throw new Exception('Search term is required');
+    }
+    
+    // Prepare the search term for LIKE query
+    $searchTerm = "%$search%";
+    
+    // First get customer summary with proper amount calculations
+    $summaryQuery = "
+        SELECT 
+            c.customer_id,
+            c.name as customer_name,
+            c.phone,
+            c.adadress,
+            COUNT(DISTINCT o.order_id) as total_orders,
+            SUM(o.total_amount) as total_amount,
+            COALESCE(SUM(
+                (SELECT COALESCE(SUM(amount), 0)
+                FROM payments p
+                WHERE p.order_id = o.order_id)
+            ), 0) as total_paid,
+            SUM(
+                o.total_amount - COALESCE(
+                    (SELECT SUM(amount)
+                    FROM payments p
+                    WHERE p.order_id = o.order_id),
+                0)
+            ) as total_remaining,
+            COUNT(CASE WHEN o.status = 'Fulfilled' THEN 1 END) as fulfilled_orders,
+            COUNT(CASE WHEN o.status = 'Partially_Paid' THEN 1 END) as partial_orders,
+            COUNT(CASE WHEN o.status = 'Pending' THEN 1 END) as pending_orders,
+            MAX(o.order_date) as last_order_date
+        FROM customers c
+        LEFT JOIN orders o ON c.customer_id = o.customer_id
+        WHERE LOWER(c.name) LIKE LOWER(?) OR c.phone LIKE ?
+        GROUP BY c.customer_id";
+
+    $stmt = $pdo->prepare($summaryQuery);
+    $stmt->execute([$searchTerm, $searchTerm]);
+    error_log("Search Term: " . $searchTerm); // Debug log
+    $customerSummary = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    error_log("Customer Summary: " . print_r($customerSummary, true)); // Debug log
+    
+    if (empty($customerSummary)) {
+        echo json_encode([
+            'success' => true,
+            'orders' => [],
+            'summary' => [],
+            'message' => 'No customers found'
+        ]);
+        exit;
+    }
+    
+    // Get customer orders with proper amount calculations
+    $query = "
+        SELECT 
+            o.order_id,
+            o.order_date,
+            o.delivery_date,
+            o.order_type,
+            o.total_amount,
+            (SELECT COALESCE(SUM(amount), 0)
+             FROM payments p
+             WHERE p.order_id = o.order_id) as paid_amount,
+            (o.total_amount - COALESCE(
+                (SELECT SUM(amount)
+                FROM payments p
+                WHERE p.order_id = o.order_id),
+            0)) as remaining_amount,
+            o.status,
+            c.name as customer_name,
+            c.phone,
+            c.address,
+            GROUP_CONCAT(
+                CONCAT(
+                    COALESCE(oi.custom_item_name, mi.name),
+                    ' (', oi.quantity, ' x ', oi.unit_price, ' = ', (oi.quantity * oi.unit_price), ')'
+                ) SEPARATOR '|'
+            ) as items,
+            (
+                SELECT GROUP_CONCAT(
+                    CONCAT(
+                        amount, ' on ', DATE_FORMAT(payment_date, '%Y-%m-%d %H:%i')
+                    ) SEPARATOR '|'
+                )
+                FROM payments p
+                WHERE p.order_id = o.order_id
+            ) as payments
+        FROM orders o
+        JOIN customers c ON o.customer_id = c.customer_id
+        LEFT JOIN order_items oi ON o.order_id = oi.order_id
+        LEFT JOIN menu_items mi ON oi.item_id = mi.item_id
+        WHERE LOWER(c.name) LIKE LOWER(?) OR c.phone LIKE ?
+        GROUP BY o.order_id
+        ORDER BY o.order_date DESC";
+
+    $stmt = $pdo->prepare($query);
+    $stmt->execute([$searchTerm, $searchTerm]);
+    $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Format the data for display
+    foreach ($orders as &$order) {
+        $order['items'] = $order['items'] ? array_filter(array_map('trim', explode('|', $order['items']))) : [];
+        $order['payments'] = $order['payments'] ? array_filter(array_map('trim', explode('|', $order['payments']))) : [];
+        
+        // Ensure amounts are properly formatted as numbers first
+        $order['total_amount'] = floatval($order['total_amount']);
+        $order['paid_amount'] = floatval($order['paid_amount']);
+        $order['remaining_amount'] = floatval($order['remaining_amount']);
+        
+        
+    }
+
+    // Format summary amounts consistently
+    foreach ($customerSummary as &$summary) {
+        
+        $summary['last_order_date'] = date('Y-m-d', strtotime($summary['last_order_date']));
+    }
+
+    echo json_encode([
+        'success' => true,
+        'orders' => $orders,
+        'summary' => $customerSummary
+    ]);
+
+} catch (Exception $e) {
+    error_log("Error in customer_history.php: " . $e->getMessage());
+    echo json_encode([
+        'success' => false,
+        'message' => $e->getMessage()
+    ]);
 }
-.text-muted {
-    color: #6c757d !important;
-}
-</style>
-
-<div class="card">
-    <div class="card-header bg-primary text-white">
-        <h5 class="mb-0">Customer History</h5>
-    </div>
-    <div class="card-body">
-        <!-- Search Form -->
-        <form id="searchForm" class="mb-4">
-            <div class="row">
-                <div class="col-md-6">
-                    <div class="input-group">
-                        <input type="text" class="form-control" id="customerSearch" name="search" placeholder="Enter customer name or phone number">
-                        <button type="submit" class="btn btn-primary">
-                            <i class="fas fa-search"></i> Search
-                        </button>
-                    </div>
-                </div>
-            </div>
-        </form>
-
-        <!-- Results Area -->
-        <div id="customerSummary" class="mb-4" style="display: none;"></div>
-        <div id="searchResults"></div>
-    </div>
-</div>
-
-<script>
-$(document).ready(function() {
-    // Handle form submission
-    $('#searchForm').on('submit', function(e) {
-        e.preventDefault();
-        const searchTerm = $('#customerSearch').val().trim();
-        if (searchTerm) {
-            searchCustomers(searchTerm);
-        }
-    });
-
-    // Function to perform search
-    function searchCustomers(searchTerm) {
-        // Show loading state
-        $('#searchResults').html('<div class="text-center"><i class="fas fa-spinner fa-spin"></i> Loading...</div>');
-        $('#customerSummary').hide();
-
-        // Make API call
-        $.ajax({
-            url: '../api/customer_history.php',
-            type: 'GET',
-            data: { search: searchTerm },
-            success: function(response) {
-                if (!response.success) {
-                    $('#searchResults').html('<div class="alert alert-danger">Error: ' + (response.message || 'Failed to load results') + '</div>');
-                    return;
-                }
-
-                if (!response.orders || response.orders.length === 0) {
-                    $('#searchResults').html('<div class="alert alert-info">No orders found for this customer</div>');
-                    return;
-                }
-
-                // Build the results table
-                let html = '<div class="table-responsive"><table class="table table-striped">';
-                html += `<thead>
-                    <tr>
-                        <th>Order ID</th>
-                        <th>Customer</th>
-                        <th>Order Date</th>
-                        <th>Type</th>
-                        <th>Total</th>
-                        <th>Paid</th>
-                        <th>Balance</th>
-                        <th>Status</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>`;
-
-                response.orders.forEach(function(order) {
-                    html += `
-                        <tr>
-                            <td>${order.order_id}</td>
-                            <td>
-                                ${order.customer_name}<br>
-                                <small class="text-muted">${order.phone}</small>
-                            </td>
-                            <td>${order.order_date}</td>
-                            <td>${order.order_type}</td>
-                            <td>PKR ${parseFloat(order.total_amount).toLocaleString()}</td>
-                            <td>PKR ${parseFloat(order.paid_amount).toLocaleString()}</td>
-                            <td>PKR ${parseFloat(order.remaining_amount).toLocaleString()}</td>
-                            <td><span class="badge bg-${getStatusColor(order.status)}">${order.status}</span></td>
-                            <td>
-                                <div class="btn-group">
-                                    <button type="button" class="btn btn-info btn-sm view-order" data-id="${order.order_id}">
-                                        <i class="fas fa-eye"></i>
-                                    </button>
-                                    <button type="button" class="btn btn-primary btn-sm add-payment" data-id="${order.order_id}" data-remaining="${order.remaining_amount}">
-                                        <i class="fas fa-plus"></i>
-                                    </button>
-                                    <button type="button" class="btn btn-success btn-sm print-order" data-id="${order.order_id}">
-                                        <i class="fas fa-print"></i>
-                                    </button>
-                                </div>
-                            </td>
-                        </tr>
-                        <tr id="details-${order.order_id}" style="display: none;">
-                            <td colspan="9">
-                                <div class="card">
-                                    <div class="card-body">
-                                        <h6>Order Items:</h6>
-                                        <ul>
-                                            ${order.items.map(item => `<li>${item}</li>`).join('')}
-                                        </ul>
-                                        ${order.payments.length > 0 ? `
-                                            <h6>Payment History:</h6>
-                                            <ul>
-                                                ${order.payments.map(payment => `<li>${payment}</li>`).join('')}
-                                            </ul>
-                                        ` : ''}
-                                    </div>
-                                </div>
-                            </td>
-                        </tr>`;
-                });
-
-                // Add summary row if we have summary data
-                if (response.summary && response.summary.length > 0) {
-                    const summary = response.summary[0];
-                    html += `
-                        </tbody>
-                        <tfoot>
-                            <tr class="table-dark">
-                                <td colspan="4"><strong>Total Summary:</strong></td>
-                                <td><strong>PKR ${parseFloat(summary.total_amount).toLocaleString()}</strong></td>
-                                <td><strong>PKR ${parseFloat(summary.total_paid).toLocaleString()}</strong></td>
-                                <td><strong>PKR ${parseFloat(summary.total_remaining).toLocaleString()}</strong></td>
-                                <td colspan="2"></td>
-                            </tr>
-                        </tfoot>`;
-
-                    // Show customer summary card
-                    $('#customerSummary').html(`
-                        <div class="card mb-4">
-                            <div class="card-body">
-                                <h5 class="card-title">${summary.customer_name}</h5>
-                                <p class="card-text">
-                                    <strong>Phone:</strong> ${summary.phone}<br>
-                                    <strong>Total Orders:</strong> ${summary.total_orders}<br>
-                                    <strong>Total Amount:</strong> PKR ${parseFloat(summary.total_amount).toLocaleString()}<br>
-                                    <strong>Total Paid:</strong> PKR ${parseFloat(summary.total_paid).toLocaleString()}<br>
-                                    <strong>Balance:</strong> PKR ${parseFloat(summary.total_remaining).toLocaleString()}<br>
-                                    <strong>Last Order:</strong> ${summary.last_order_date}
-                                </p>
-                                <div class="order-status mt-3">
-                                    <span class="badge bg-success">${summary.fulfilled_orders} Fulfilled</span>
-                                    <span class="badge bg-warning">${summary.partial_orders} Partially Paid</span>
-                                    <span class="badge bg-danger">${summary.pending_orders} Pending</span>
-                                </div>
-                            </div>
-                        </div>
-                    `).show();
-                }
-
-                html += '</table></div>';
-                $('#searchResults').html(html);
-
-                // Initialize event handlers
-                initializeEventHandlers();
-            },
-            error: function(xhr, status, error) {
-                $('#searchResults').html('<div class="alert alert-danger">Error loading results. Please try again.</div>');
-                console.error('Search error:', error);
-            }
-        });
-    }
-
-    // Initialize event handlers
-    function initializeEventHandlers() {
-        // View order details
-        $('.view-order').click(function() {
-            const orderId = $(this).data('id');
-            $(`#details-${orderId}`).toggle();
-        });
-
-        // Add payment
-        $('.add-payment').click(function() {
-            const orderId = $(this).data('id');
-            const remainingAmount = $(this).data('remaining');
-            $('#addIncomeModal').modal('show');
-            $('#orderSelect').val(orderId).trigger('change');
-            $('#amount').val(remainingAmount);
-        });
-
-        // Print order
-        $('.print-order').click(function() {
-            const orderId = $(this).data('id');
-            window.location.href = `print.php?order_id=${orderId}`;
-        });
-    }
-
-    // Helper function for status colors
-    function getStatusColor(status) {
-        switch(status) {
-            case 'Fulfilled': return 'success';
-            case 'Partially_Paid': return 'warning';
-            case 'Pending': return 'danger';
-            default: return 'secondary';
-        }
-    }
-});
-</script> 
+?> 
