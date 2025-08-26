@@ -1,23 +1,37 @@
 <?php
-// Simple direct database connection for printing
+// Enable error reporting for debugging
 ini_set('display_errors', 1);
 ini_set('display_startup_errors', 1);
 error_reporting(E_ALL);
 
-// Database connection parameters
-$db_server = 'localhost';
-$db_username = 'jani_pakwan';
-$db_password = 'SkipHire@8182';
-$db_name = 'jani_pakwan';
+function debug_file_exists($path) {
+    if (file_exists($path)) {
+        return "File exists: " . $path;
+    } else {
+        return "File DOES NOT exist: " . $path;
+    }
+}
 
-// Get order ID
-$order_id = isset($_GET['order_id']) ? intval($_GET['order_id']) : 0;
+// Debug file paths
+$debug_info = [];
+$debug_info[] = debug_file_exists(__DIR__ . '/../includes/db.php');
+$debug_info[] = debug_file_exists(__DIR__ . '/../includes/functions.php');
+$debug_info[] = debug_file_exists(__DIR__ . '/../config/database.php');
 
 try {
-    // Connect to database directly
-    $pdo = new PDO("mysql:host=$db_server;dbname=$db_name;charset=utf8mb4", $db_username, $db_password);
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    
+    require_once __DIR__ . '/../includes/db.php';
+    require_once __DIR__ . '/../includes/functions.php';
+
+    // Get order ID from GET parameters
+    $order_id = isset($_GET['order_id']) ? intval($_GET['order_id']) : 0;
+
+    if ($order_id <= 0) {
+        throw new Exception("Invalid order ID: " . $order_id);
+    }
+
+    // Get database connection
+    $pdo = getDbConnection();
+
     // Get order details
     $query = "
         SELECT o.*, c.name as customer_name, c.phone, c.address 
@@ -53,7 +67,19 @@ try {
     echo "<p>" . htmlspecialchars($e->getMessage()) . "</p>";
     echo "<h4>Technical Details:</h4>";
     echo "<pre>" . htmlspecialchars($e->getTraceAsString()) . "</pre>";
-    echo "<p><a href='index.html' class='btn btn-secondary'>Return to Dashboard</a></p>";
+    
+    // Display debug info
+    echo "<h4>File Paths:</h4>";
+    echo "<ul>";
+    foreach ($debug_info as $info) {
+        echo "<li>" . htmlspecialchars($info) . "</li>";
+    }
+    echo "</ul>";
+    
+    echo "<h4>Server Path:</h4>";
+    echo "<pre>" . htmlspecialchars(__DIR__) . "</pre>";
+    
+    echo "<p><a href='../index.html' class='btn btn-secondary'>Return to Dashboard</a></p>";
     echo "</div>";
     exit;
 }
@@ -66,6 +92,7 @@ try {
     <title>Order #<?php echo $order_id; ?> - Print</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="../css/style.css" rel="stylesheet">
     
     <!-- Add Google Fonts - Noto Nastaliq Urdu -->
     <link href="https://fonts.googleapis.com/css2?family=Noto+Nastaliq+Urdu:wght@400;600;700&display=swap" rel="stylesheet">
@@ -177,7 +204,10 @@ try {
         <button class="btn btn-primary" onclick="window.print()">
             <i class="fas fa-print"></i> Print
         </button>
-        <a href="index.html" class="btn btn-secondary ms-2">
+        <button class="btn btn-success ms-2" onclick="generatePDF()">
+            <i class="fas fa-file-pdf"></i> Save as PDF
+        </button>
+        <a href="../index.html" class="btn btn-secondary ms-2">
             <i class="fas fa-home"></i> Back to Dashboard
         </a>
     </div>
@@ -283,7 +313,7 @@ try {
             </div>
         </div>
     </div>
-
+    
     <!-- Page Break -->
     <div class="page-break"></div>
     
@@ -403,6 +433,7 @@ try {
     <!-- Scripts -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
     <script>
         $(document).ready(function() {
             // Auto-print after page load (with a slight delay to ensure fonts are loaded)
@@ -410,6 +441,29 @@ try {
                 window.print();
             }, 1500);
         });
+        
+        function generatePDF() {
+            // Configure PDF options
+            const options = {
+                margin: 10,
+                filename: 'Order-<?php echo $order_id; ?>-receipt.pdf',
+                image: { type: 'jpeg', quality: 0.98 },
+                html2canvas: { scale: 2, useCORS: true },
+                jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
+            };
+            
+            // Get all print containers
+            const elements = document.querySelectorAll('.print-container');
+            
+            // Create a new container to combine all sections
+            const combinedElement = document.createElement('div');
+            elements.forEach(element => {
+                combinedElement.appendChild(element.cloneNode(true));
+            });
+            
+            // Generate PDF
+            html2pdf().set(options).from(combinedElement).save();
+        }
     </script>
 </body>
 </html> 
